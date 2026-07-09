@@ -8,6 +8,16 @@ import httpx
 from pydantic import BaseModel
 
 
+
+def _unwrap(result: Any) -> Any:
+    """Unwrap PropellerAds API envelopes: {result: [...]}, {items: [...]}, or {data: ...}."""
+    if isinstance(result, dict):
+        for key in ("result", "items", "data"):
+            if key in result:
+                return result[key]
+    return result
+
+
 class PropellerAdsError(Exception):
     """PropellerAds API error."""
     pass
@@ -98,17 +108,17 @@ class PropellerAdsClient:
             params["name"] = name
 
         result = self._request("GET", "/adv/campaigns", params=params or None)
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def get_campaign(self, campaign_id: int) -> dict[str, Any]:
         """Get campaign details by ID."""
         result = self._request("GET", f"/adv/campaigns/{campaign_id}")
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def create_campaign(self, campaign_data: dict[str, Any]) -> dict[str, Any]:
         """Create a new campaign."""
         result = self._request("POST", "/adv/campaigns", json_data=campaign_data)
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def update_campaign(
         self, campaign_id: int, updates: dict[str, Any]
@@ -117,7 +127,7 @@ class PropellerAdsClient:
         result = self._request(
             "PUT", f"/adv/campaigns/{campaign_id}", json_data=updates
         )
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def start_campaigns(self, campaign_ids: list[int]) -> dict[str, Any]:
         """Start (activate) campaigns."""
@@ -143,7 +153,7 @@ class PropellerAdsClient:
         result = self._request(
             "POST", f"/adv/campaigns/{campaign_id}/clone", json_data=data or None
         )
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     # ========== Statistics Methods ==========
 
@@ -162,22 +172,30 @@ class PropellerAdsClient:
         if not date_to:
             date_to = datetime.now().strftime("%Y-%m-%d")
 
+        # API expects day_from/day_to as full datetimes; expand bare dates
+        if len(date_from) == 10:
+            date_from = f"{date_from} 00:00:00"
+        if len(date_to) == 10:
+            date_to = f"{date_to} 23:59:59"
+
         params: dict[str, Any] = {
-            "date_from": date_from,
-            "date_to": date_to,
+            "day_from": date_from,
+            "day_to": date_to,
         }
 
-        if group_by:
-            for i, gb in enumerate(group_by):
-                params[f"group_by[{i}]"] = gb
+        # API requires at least one group_by
+        if not group_by:
+            group_by = ["campaign_id"]
+        for i, gb in enumerate(group_by):
+            params[f"group_by[{i}]"] = gb
 
         if campaign_id:
-            params["campaign_id"] = campaign_id
+            params["campaign_id[]"] = campaign_id
         if zone_id:
-            params["zone_id"] = zone_id
+            params["zone_id[]"] = zone_id
 
         result = self._request("GET", "/adv/statistics", params=params)
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def get_campaign_statistics(
         self,
@@ -234,17 +252,17 @@ class PropellerAdsClient:
             params["campaign_id"] = campaign_id
 
         result = self._request("GET", "/adv/creatives", params=params or None)
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def get_creative(self, creative_id: int) -> dict[str, Any]:
         """Get creative details."""
         result = self._request("GET", f"/adv/creatives/{creative_id}")
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def create_creative(self, creative_data: dict[str, Any]) -> dict[str, Any]:
         """Create a new creative."""
         result = self._request("POST", "/adv/creatives", json_data=creative_data)
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def update_creative(
         self, creative_id: int, updates: dict[str, Any]
@@ -253,7 +271,7 @@ class PropellerAdsClient:
         result = self._request(
             "PUT", f"/adv/creatives/{creative_id}", json_data=updates
         )
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     # ========== Targeting Methods ==========
 
@@ -264,7 +282,7 @@ class PropellerAdsClient:
             params["campaign_id"] = campaign_id
 
         result = self._request("GET", "/adv/zones", params=params or None)
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def add_zones_to_whitelist(
         self, campaign_id: int, zone_ids: list[int]
@@ -311,17 +329,17 @@ class PropellerAdsClient:
     def get_balance(self) -> dict[str, Any]:
         """Get account balance."""
         result = self._request("GET", "/adv/balance")
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def get_countries(self) -> list[dict[str, Any]]:
         """Get available countries for targeting."""
         result = self._request("GET", "/adv/countries")
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def get_ad_formats(self) -> list[dict[str, Any]]:
         """Get available ad formats."""
         result = self._request("GET", "/adv/ad-formats")
-        return result.get("data", result) if isinstance(result, dict) else result
+        return _unwrap(result)
 
     def close(self):
         """Close the HTTP client."""
