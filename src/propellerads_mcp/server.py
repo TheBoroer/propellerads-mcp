@@ -147,54 +147,72 @@ TOOLS = [
     ),
     Tool(
         name="create_campaign",
-        description="Create a new advertising campaign with specified settings.",
+        description=(
+            "Create a campaign (POST /adv/campaigns). Created in draft (status=1) by default; "
+            "start it later with start_campaigns. For Push CPA Goal use direction='nativeads', "
+            "rate_model='cpag'; for Onclick popunder use direction='onclick'. CPA/SCPA rate models "
+            "require ${SUBID} in target_url. Note: campaigns cannot be deleted via API, only archived."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Campaign name"},
-                "ad_format": {
+                "direction": {
                     "type": "string",
-                    "description": "Ad format: push, onclick, interstitial, in-page-push",
+                    "enum": ["onclick", "nativeads"],
+                    "description": "onclick = popunder; nativeads = push/native/interstitial",
+                },
+                "rate_model": {
+                    "type": "string",
+                    "enum": ["cpm", "scpm", "cpc", "scpc", "scpa", "cpag"],
+                    "description": "cpag = CPA Goal for Push; scpa = CPA Goal for Onclick; cpc/cpm = fixed bid",
+                },
+                "target_url": {
+                    "type": "string",
+                    "description": "Landing URL. Must include ${SUBID} for cpag/scpa/cpa models",
                 },
                 "countries": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Target country codes (e.g., ['US', 'GB', 'DE'])",
+                    "description": "ISO alpha-2 lowercase country codes (e.g. ['us','gb','de'])",
                 },
-                "daily_budget": {
-                    "type": "number",
-                    "description": "Daily budget in USD",
-                },
-                "total_budget": {
-                    "type": "number",
-                    "description": "Total campaign budget in USD",
-                },
-                "bid": {"type": "number", "description": "Bid amount (CPC/CPM)"},
-                "bid_model": {
+                "bid": {"type": "number", "description": "Base bid in dollars (builds the rate row)"},
+                "started_at": {
                     "type": "string",
-                    "description": "Bid model: cpc, cpm, smart_cpc, smart_cpm",
+                    "description": "Start date in dd/MM/YYYY format",
                 },
-                "target_url": {"type": "string", "description": "Landing page URL"},
+                "daily_amount": {"type": "number", "description": "Daily budget cap in USD (Push CPC min $10)"},
+                "total_amount": {"type": "number", "description": "Total budget cap in USD (must exceed daily)"},
+                "cpa_goal_bid": {"type": "number", "description": "Target CPA in dollars (sets cpa_goal_status=true)"},
+                "user_activity": {
+                    "type": "array",
+                    "items": {"type": "integer", "enum": [1, 2, 3]},
+                    "description": "1=High, 2=Medium, 3=Low activity (protocol: High+Medium only)",
+                },
+                "frequency": {"type": "integer", "description": "Impressions per user per capping window"},
+                "capping": {"type": "integer", "description": "Frequency-cap window in hours (e.g. 24)"},
+                "timezone": {"type": "integer", "description": "UTC offset, default -5"},
+                "status": {"type": "integer", "enum": [1, 2], "description": "1=draft (default), 2=submit to moderation"},
             },
-            "required": ["name", "ad_format", "countries", "daily_budget", "bid", "target_url"],
+            "required": ["name", "direction", "rate_model", "target_url", "countries", "bid", "started_at"],
         },
     ),
     Tool(
         name="update_campaign",
-        description="Update campaign settings like budget, bid, targeting, or status.",
+        description=(
+            "Update a campaign (PATCH /adv/campaigns/{id}). Only name, frequency, capping, and "
+            "budget caps are editable here. For bids use set_campaign_rate / set_zone_rate; for "
+            "status use start_campaigns / stop_campaigns; for the landing URL use update_campaign_url."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "campaign_id": {"type": "integer", "description": "Campaign ID"},
                 "name": {"type": "string", "description": "New campaign name"},
-                "daily_budget": {"type": "number", "description": "New daily budget"},
-                "total_budget": {"type": "number", "description": "New total budget"},
-                "bid": {"type": "number", "description": "New bid amount"},
-                "status": {
-                    "type": "string",
-                    "description": "New status: active, paused",
-                    "enum": ["active", "paused"],
-                },
+                "frequency": {"type": "integer", "description": "Impressions per user per capping window"},
+                "capping": {"type": "integer", "description": "Frequency-cap window in hours (e.g. 24)"},
+                "limit_daily_amount": {"type": "number", "description": "New daily budget cap in USD"},
+                "limit_total_amount": {"type": "number", "description": "New total budget cap in USD"},
             },
             "required": ["campaign_id"],
         },
@@ -309,6 +327,83 @@ TOOLS = [
                 },
             },
             "required": ["campaign_id", "amount"],
+        },
+    ),
+    Tool(
+        name="update_campaign_url",
+        description="Set a new landing/target URL for all of a campaign's materials. WARNING: sends the campaign back through moderation. Keep the ${SUBID} macro for tracking.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+                "url": {"type": "string", "description": "New target URL (include ${SUBID} for tracking)"},
+            },
+            "required": ["campaign_id", "url"],
+        },
+    ),
+    Tool(
+        name="get_zone_rates",
+        description="List per-zone bid overrides for a campaign (autonomous per-placement bids). Read-only.",
+        inputSchema={
+            "type": "object",
+            "properties": {"campaign_id": {"type": "integer", "description": "Campaign ID"}},
+            "required": ["campaign_id"],
+        },
+    ),
+    Tool(
+        name="set_zone_rate",
+        description="Set a custom bid for ONE zone in a campaign (dollars). Bid a converting zone up or a marginal zone down instead of hard black/whitelisting it. ONLY supported on fixed-bid (CPC/CPM) campaigns; CPA Goal (cpag/scpa) campaigns bid automatically and reject this with 'Unsupported campaign' - use blacklist/whitelist there instead.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+                "zone_id": {"type": "integer", "description": "Zone ID"},
+                "amount": {"type": "number", "description": "Bid for this zone in dollars"},
+            },
+            "required": ["campaign_id", "zone_id", "amount"],
+        },
+    ),
+    Tool(
+        name="delete_zone_rate",
+        description="Remove a zone's custom bid override; the zone reverts to the campaign base bid.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+                "zone_id": {"type": "integer", "description": "Zone ID"},
+            },
+            "required": ["campaign_id", "zone_id"],
+        },
+    ),
+    Tool(
+        name="get_zone_groups",
+        description="List available zone groups (reusable zone bundles for targeting).",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="query_statistics",
+        description="Advanced statistics via POST: server-side metric-threshold filtering and sorting on top of grouping. Use to pull, e.g., zones with spend>=$10 and 0 conversions, sorted by spend, in one call.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "day_from": {"type": "string", "description": "Start date YYYY-MM-DD"},
+                "day_to": {"type": "string", "description": "End date YYYY-MM-DD"},
+                "group_by": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Grouping: campaign, zone, creative, country, date, os, device, browser",
+                },
+                "campaign_id": {"type": "integer", "description": "Filter to a campaign"},
+                "order_by": {"type": "string", "description": "Field to sort by (e.g. spent, clicks, conversions, ctr)"},
+                "order_dest": {"type": "string", "enum": ["asc", "desc"], "description": "Sort direction (default desc)"},
+                "min_impressions": {"type": "integer"},
+                "min_clicks": {"type": "integer"},
+                "min_conversions": {"type": "integer"},
+                "max_conversions": {"type": "integer"},
+                "min_spend": {"type": "number", "description": "Minimum spend (dollars)"},
+                "max_spend": {"type": "number", "description": "Maximum spend (dollars)"},
+            },
+            "required": ["day_from", "day_to"],
         },
     ),
     # Statistics & Reports
@@ -611,21 +706,33 @@ async def handle_tool(
         return f"# Campaign Details\n\n```json\n{json.dumps(campaign, indent=2)}\n```"
 
     elif name == "create_campaign":
-        campaign_data = {
-            "name": args["name"],
-            "ad_format": args["ad_format"],
-            "countries": args["countries"],
-            "daily_budget": args["daily_budget"],
-            "bid": args["bid"],
-            "target_url": args["target_url"],
+        countries = [c.lower() for c in args["countries"]]
+        targeting: dict[str, Any] = {
+            "country": {"list": countries, "is_excluded": False},
         }
-        if args.get("total_budget"):
-            campaign_data["total_budget"] = args["total_budget"]
-        if args.get("bid_model"):
-            campaign_data["bid_model"] = args["bid_model"]
+        if args.get("user_activity"):
+            targeting["user_activity"] = {"list": args["user_activity"], "is_excluded": False}
+
+        campaign_data: dict[str, Any] = {
+            "name": args["name"],
+            "direction": args["direction"],
+            "rate_model": args["rate_model"],
+            "target_url": args["target_url"],
+            "status": args.get("status", 1),
+            "started_at": args["started_at"],
+            "timezone": args.get("timezone", -5),
+            "targeting": targeting,
+            "rates": [{"amount": args["bid"], "countries": countries}],
+        }
+        for k in ("daily_amount", "total_amount", "frequency", "capping"):
+            if args.get(k) is not None:
+                campaign_data[k] = args[k]
+        if args.get("cpa_goal_bid") is not None:
+            campaign_data["cpa_goal_bid"] = args["cpa_goal_bid"]
+            campaign_data["cpa_goal_status"] = True
 
         result = client.create_campaign(campaign_data)
-        return f"Campaign created successfully!\n\n```json\n{json.dumps(result, indent=2)}\n```"
+        return f"Campaign created (draft unless status=2).\n\n```json\n{json.dumps(result, indent=2)}\n```"
 
     elif name == "update_campaign":
         campaign_id = args.pop("campaign_id")
@@ -682,6 +789,80 @@ async def handle_tool(
             f"({', '.join(args.get('countries') or ['all countries'])}).\n\n"
             f"{json.dumps(result, indent=2)}"
         )
+
+    elif name == "update_campaign_url":
+        result = client.update_campaign_url(args["campaign_id"], args["url"])
+        return (
+            f"Updated target URL for campaign {args['campaign_id']}. "
+            f"NOTE: the campaign now re-enters moderation.\n\n{json.dumps(result, indent=2)}"
+        )
+
+    elif name == "get_zone_rates":
+        rates = client.get_zone_rates(args["campaign_id"])
+        if not rates:
+            return f"No per-zone rate overrides on campaign {args['campaign_id']}."
+        lines = [f"# Per-zone rates: campaign {args['campaign_id']}\n"]
+        for r in rates:
+            lines.append(f"- Zone {r.get('zone_id')}: {format_currency(_num(r.get('amount')))}\n")
+        return "".join(lines)
+
+    elif name == "set_zone_rate":
+        result = client.set_zone_rate(args["campaign_id"], args["zone_id"], args["amount"])
+        return (
+            f"Set zone {args['zone_id']} bid to {format_currency(_num(args['amount']))} "
+            f"on campaign {args['campaign_id']}.\n\n{json.dumps(result, indent=2)}"
+        )
+
+    elif name == "delete_zone_rate":
+        client.delete_zone_rate(args["campaign_id"], args["zone_id"])
+        return f"Removed zone {args['zone_id']} bid override on campaign {args['campaign_id']} (reverts to base bid)."
+
+    elif name == "get_zone_groups":
+        groups = client.get_zone_groups()
+        return f"# Zone Groups\n\n```json\n{json.dumps(groups, indent=2)}\n```"
+
+    elif name == "query_statistics":
+        def _rng(mn: Any, mx: Any) -> dict[str, int] | None:
+            d: dict[str, int] = {}
+            if mn is not None:
+                d["from"] = int(mn)
+            if mx is not None:
+                d["to"] = int(mx)
+            return d or None
+
+        filters: dict[str, dict[str, int]] = {}
+        if (r := _rng(args.get("min_impressions"), None)):
+            filters["impressions"] = r
+        if (r := _rng(args.get("min_clicks"), None)):
+            filters["clicks"] = r
+        if (r := _rng(args.get("min_conversions"), args.get("max_conversions"))):
+            filters["conversions"] = r
+        if (r := _rng(args.get("min_spend"), args.get("max_spend"))):
+            filters["spent"] = r
+
+        rows = client.query_statistics(
+            day_from=args["day_from"],
+            day_to=args["day_to"],
+            group_by=args.get("group_by"),
+            campaign_id=args.get("campaign_id"),
+            order_by=args.get("order_by"),
+            order_dest=args.get("order_dest", "desc"),
+            filters=filters or None,
+        )
+        if not rows:
+            return "No rows matched the filters."
+
+        dims = ("campaign_id", "zone_id", "banner_id", "country_id", "date_time")
+        lines = [f"# Statistics ({len(rows)} rows)\n"]
+        for row in rows:
+            m = calculate_metrics(row)
+            key = " ".join(f"{d}={row[d]}" for d in dims if row.get(d) is not None) or "(all)"
+            lines.append(
+                f"- {key} | impr {m['impressions']:,} | clicks {m['clicks']:,} | "
+                f"conv {m['conversions']} (g2 {m['conversions2']}) | "
+                f"spent {format_currency(m['spend'])} | CPA {format_currency(m['cpa'])}\n"
+            )
+        return "".join(lines)
 
     # Statistics
     elif name == "get_performance_report":

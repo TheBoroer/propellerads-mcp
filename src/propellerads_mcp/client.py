@@ -106,7 +106,7 @@ class PropellerAdsClient:
         method: str,
         endpoint: str,
         params: dict[str, Any] | None = None,
-        json_data: dict[str, Any] | None = None,
+        json_data: dict[str, Any] | list[Any] | None = None,
     ) -> dict[str, Any]:
         """Make API request."""
         try:
@@ -117,6 +117,9 @@ class PropellerAdsClient:
                 json=json_data,
             )
             response.raise_for_status()
+            # DELETE / Success responses may be 204 or empty-bodied
+            if response.status_code == 204 or not response.content:
+                return {}
             return response.json()
         except httpx.HTTPStatusError as e:
             error_detail = ""
@@ -163,9 +166,12 @@ class PropellerAdsClient:
     def update_campaign(
         self, campaign_id: int, updates: dict[str, Any]
     ) -> dict[str, Any]:
-        """Update campaign settings."""
+        """Update campaign settings. Spec: PATCH /adv/campaigns/{id} (not PUT). The
+        endpoint only accepts name / frequency / capping / limit_daily_amount /
+        limit_total_amount. Bids go through zone/campaign rates, status via play/stop,
+        target URL via /url, targeting via the targeting endpoints."""
         result = self._request(
-            "PUT", f"/adv/campaigns/{campaign_id}", json_data=updates
+            "PATCH", f"/adv/campaigns/{campaign_id}", json_data=updates
         )
         return _unwrap(result)
 
@@ -422,6 +428,107 @@ class PropellerAdsClient:
             f"/adv/campaigns/{campaign_id}/rates",
             json_data={"rates": rates},
         )
+
+    # ========== Per-zone rates (autonomous per-placement bidding) ==========
+
+    def get_zone_rates(self, campaign_id: int) -> list[dict[str, Any]]:
+        """List per-zone rate overrides. Spec: GET /adv/campaigns/{id}/zone_rates."""
+        return _unwrap(
+            self._request("GET", f"/adv/campaigns/{campaign_id}/zone_rates")
+        )
+
+    def set_zone_rate(
+        self, campaign_id: int, zone_id: int, amount: float
+    ) -> dict[str, Any]:
+        """Set/override the bid for a single zone (dollars). Spec:
+        PUT /adv/campaigns/{id}/zone_rates/{zoneId} {amount}."""
+        return self._request(
+            "PUT",
+            f"/adv/campaigns/{campaign_id}/zone_rates/{zone_id}",
+            json_data={"amount": amount},
+        )
+
+    def delete_zone_rate(self, campaign_id: int, zone_id: int) -> dict[str, Any]:
+        """Remove a single zone's rate override (reverts to campaign base bid).
+        Spec: DELETE /adv/campaigns/{id}/zone_rates/{zoneId}."""
+        return self._request(
+            "DELETE", f"/adv/campaigns/{campaign_id}/zone_rates/{zone_id}"
+        )
+
+    def set_zone_rates_bulk(
+        self, campaign_id: int, zone_rates: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Replace ALL per-zone rates at once. Body is a bare array
+        [{amount, zone_id}, ...]. Spec: PUT /adv/campaigns/{id}/zone_rates."""
+        return self._request(
+            "PUT", f"/adv/campaigns/{campaign_id}/zone_rates", json_data=zone_rates
+        )
+
+    # ========== Target URL ==========
+
+    def update_campaign_url(self, campaign_id: int, url: str) -> dict[str, Any]:
+        """Set a new target URL for all of a campaign's materials. NOTE: this sends the
+        campaign back through moderation. Spec: PUT /adv/campaigns/{id}/url {url}."""
+        return self._request(
+            "PUT", f"/adv/campaigns/{campaign_id}/url", json_data={"url": url}
+        )
+
+    # ========== Zone groups ==========
+
+    def get_zone_groups(self) -> list[dict[str, Any]]:
+        """List zone groups. Spec: GET /adv/zone-groups/ (hyphenated, trailing slash)."""
+        return _unwrap(self._request("GET", "/adv/zone-groups/"))
+
+    # ========== Statistics (POST: server-side filters + sorting) ==========
+
+    def query_statistics(
+        self,
+        day_from: str,
+        day_to: str,
+        group_by: list[str] | None = None,
+        campaign_id: int | list[int] | None = None,
+        zone_id: int | list[int] | None = None,
+        banner_id: int | list[int] | None = None,
+        geo: list[str] | None = None,
+        order_by: str | None = None,
+        order_dest: str = "desc",
+        filters: dict[str, dict[str, int]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """POST /adv/statistics with server-side filtering + sorting.
+
+        filters: {metric: {"from": n, "to": m}} for impressions/clicks/conversions/
+        conversions2/spent/ctr/cr. order_by: any response field; order_dest asc|desc.
+        Richer than the GET wrapper (get_statistics), which only groups.
+        """
+        if len(day_from) == 10:
+            day_from = f"{day_from} 00:00:00"
+        if len(day_to) == 10:
+            day_to = f"{day_to} 23:59:59"
+        body: dict[str, Any] = {
+            "group_by": _map_group_by(group_by or ["campaign_id"]),
+            "day_from": day_from,
+            "day_to": day_to,
+        }
+
+        def _as_list(v: Any) -> list[Any]:
+            return v if isinstance(v, list) else [v]
+
+        if campaign_id is not None:
+            body["campaign_id"] = _as_list(campaign_id)
+        if zone_id is not None:
+            body["zone_id"] = _as_list(zone_id)
+        if banner_id is not None:
+            body["banner_id"] = _as_list(banner_id)
+        if geo:
+            body["geo"] = geo
+        if order_by:
+            body["order_by"] = order_by
+            body["order_dest"] = order_dest
+        if filters:
+            for metric, rng in filters.items():
+                body[metric] = rng
+
+        return _unwrap(self._request("POST", "/adv/statistics", json_data=body))
 
     # ========== Account Methods ==========
 
