@@ -44,13 +44,44 @@ def format_percentage(value: float | None) -> str:
     return f"{value:.2f}%"
 
 
+# PropellerAds campaign status enum (components/schemas/CampaignStatus.yaml)
+CAMPAIGN_STATUS = {1: "draft", 2: "moderation", 3: "rejected", 6: "working", 7: "paused", 8: "stopped"}
+CAMPAIGN_STATUS_ICON = {1: "📝", 2: "🟡", 3: "⛔", 6: "🟢", 7: "⏸️", 8: "🔴"}
+
+
+def _num(value: Any) -> float:
+    """Coerce API numeric fields (which may arrive as strings) to float."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _status_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def status_label(value: Any) -> str:
+    """Render a campaign status int as icon + label."""
+    s = _status_int(value)
+    if s is None:
+        return str(value)
+    return f"{CAMPAIGN_STATUS_ICON.get(s, '❓')} {CAMPAIGN_STATUS.get(s, s)}"
+
+
 def calculate_metrics(stats: dict[str, Any]) -> dict[str, Any]:
     """Calculate additional metrics from raw statistics."""
-    impressions = stats.get("impressions", 0) or 0
-    clicks = stats.get("clicks", 0) or 0
-    conversions = stats.get("conversions", 0) or 0
-    spend = stats.get("spend", 0) or stats.get("cost", 0) or 0
-    revenue = stats.get("revenue", 0) or 0
+    impressions = int(_num(stats.get("impressions", 0)))
+    clicks = int(_num(stats.get("clicks", 0)))
+    conversions = int(_num(stats.get("conversions", 0)))
+    # Goal 2 = trial-to-paid (PropellerAds StatResponseRow.conversions2)
+    conversions2 = int(_num(stats.get("conversions2", 0)))
+    # Spend field is 'spent' in v5 (NOT 'spend'/'cost'); may arrive as a string
+    spend = _num(stats.get("spent", stats.get("money", stats.get("spend", stats.get("cost", 0)))))
+    revenue = _num(stats.get("payout", stats.get("revenue", 0)))
 
     ctr = (clicks / impressions * 100) if impressions > 0 else 0
     cvr = (conversions / clicks * 100) if clicks > 0 else 0
@@ -60,6 +91,12 @@ def calculate_metrics(stats: dict[str, Any]) -> dict[str, Any]:
 
     return {
         **stats,
+        "impressions": impressions,
+        "clicks": clicks,
+        "conversions": conversions,
+        "conversions2": conversions2,
+        "spend": round(spend, 4),
+        "revenue": round(revenue, 2),
         "ctr": round(ctr, 2),
         "cvr": round(cvr, 2),
         "cpc": round(cpc, 4),
@@ -495,11 +532,13 @@ async def handle_tool(
 
         lines = ["# Campaigns\n"]
         for c in campaigns:
-            status_icon = "🟢" if c.get("status") == "active" else "🔴"
+            # status is an integer enum (6=working, 7=paused, 8=stopped), not a string
+            budget = c.get("limit_daily_amount", c.get("daily_amount"))
+            archived = " [archived]" if c.get("is_archived") else ""
             lines.append(
-                f"{status_icon} **{c.get('name', 'Unnamed')}** (ID: {c.get('id')})\n"
-                f"   Format: {c.get('ad_format', 'N/A')} | "
-                f"Budget: {format_currency(c.get('daily_budget'))}/day\n"
+                f"{status_label(c.get('status'))} **{c.get('name', 'Unnamed')}** (ID: {c.get('id')}){archived}\n"
+                f"   Rate model: {c.get('rate_model', 'N/A')} | "
+                f"Daily cap: {format_currency(budget)}\n"
             )
         return "\n".join(lines)
 
@@ -565,9 +604,10 @@ async def handle_tool(
                 f"- Impressions: {s.get('impressions', 0):,}\n"
                 f"- Clicks: {s.get('clicks', 0):,}\n"
                 f"- CTR: {format_percentage(s.get('ctr'))}\n"
-                f"- Conversions: {s.get('conversions', 0):,}\n"
+                f"- Conversions (goal 1): {s.get('conversions', 0):,}\n"
+                f"- Conversions (goal 2 / trial-to-paid): {s.get('conversions2', 0):,}\n"
                 f"- CVR: {format_percentage(s.get('cvr'))}\n"
-                f"- Spend: {format_currency(s.get('spend', s.get('cost', 0)))}\n"
+                f"- Spend: {format_currency(s.get('spend', 0))}\n"
                 f"- CPC: {format_currency(s.get('cpc'))}\n"
                 f"- CPA: {format_currency(s.get('cpa'))}\n"
                 f"- Revenue: {format_currency(s.get('revenue', 0))}\n"
@@ -589,15 +629,16 @@ async def handle_tool(
 
         return (
             f"# Campaign Performance: {campaign.get('name', 'N/A')}\n\n"
-            f"**Status:** {campaign.get('status', 'N/A')}\n"
-            f"**Ad Format:** {campaign.get('ad_format', 'N/A')}\n\n"
+            f"**Status:** {status_label(campaign.get('status'))}\n"
+            f"**Rate model:** {campaign.get('rate_model', 'N/A')}\n\n"
             f"## Metrics\n"
             f"- Impressions: {metrics.get('impressions', 0):,}\n"
             f"- Clicks: {metrics.get('clicks', 0):,}\n"
             f"- CTR: {format_percentage(metrics.get('ctr'))}\n"
-            f"- Conversions: {metrics.get('conversions', 0):,}\n"
+            f"- Conversions (goal 1): {metrics.get('conversions', 0):,}\n"
+            f"- Conversions (goal 2 / trial-to-paid): {metrics.get('conversions2', 0):,}\n"
             f"- CVR: {format_percentage(metrics.get('cvr'))}\n"
-            f"- Spend: {format_currency(metrics.get('spend', metrics.get('cost', 0)))}\n"
+            f"- Spend: {format_currency(metrics.get('spend', 0))}\n"
             f"- CPA: {format_currency(metrics.get('cpa'))}\n"
             f"- Revenue: {format_currency(metrics.get('revenue', 0))}\n"
             f"- ROI: {format_percentage(metrics.get('roi'))}\n"

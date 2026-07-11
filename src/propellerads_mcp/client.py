@@ -18,6 +18,44 @@ def _unwrap(result: Any) -> Any:
     return result
 
 
+# Map friendly grouping names to PropellerAds v5 statistics enum tokens.
+# API rejects anything outside VALID_GROUP_BY with "The selected choice is invalid."
+GROUP_BY_MAP = {
+    "campaign": "campaign_id",
+    "zone": "zone_id",
+    "creative": "banner_id",
+    "banner": "banner_id",
+    "product": "product_id",
+    "country": "country_id",
+    "geo": "country_id",
+    "date": "date_time",
+    "datetime": "date_time",
+    "hour": "hour",
+    "device": "device_id",
+    "device_type": "device_id",
+    "browser": "browser_id",
+    "os": "os_id",
+    "os_type": "os_type_id",
+    "os_version": "os_version_id",
+    "language": "language_id",
+    "connection": "connection_id",
+    "mobile_isp": "mobile_isp_id",
+    "activity": "user_activity",
+    "user_activity": "user_activity",
+}
+VALID_GROUP_BY = {
+    "product_id", "campaign_id", "banner_id", "zone_id", "country_id",
+    "date_time", "hour", "device_id", "browser_id", "mobile_isp_id",
+    "os_version_id", "os_id", "os_type_id", "language_id", "connection_id",
+    "user_activity", "zone_type", "is_broker", "request_var_id",
+}
+
+
+def _map_group_by(group_by: list[str]) -> list[str]:
+    """Translate friendly grouping names to API enum tokens; pass valid tokens through."""
+    return [GROUP_BY_MAP.get(g, g) for g in group_by]
+
+
 class PropellerAdsError(Exception):
     """PropellerAds API error."""
     pass
@@ -130,16 +168,16 @@ class PropellerAdsClient:
         return _unwrap(result)
 
     def start_campaigns(self, campaign_ids: list[int]) -> dict[str, Any]:
-        """Start (activate) campaigns."""
+        """Start (activate) campaigns. Spec: PUT /adv/campaigns/play, body {campaign_ids}."""
         result = self._request(
-            "POST", "/adv/campaigns/start", json_data={"ids": campaign_ids}
+            "PUT", "/adv/campaigns/play", json_data={"campaign_ids": campaign_ids}
         )
         return result
 
     def stop_campaigns(self, campaign_ids: list[int]) -> dict[str, Any]:
-        """Stop (pause) campaigns."""
+        """Stop (pause) campaigns. Spec: PUT /adv/campaigns/stop, body {campaign_ids}."""
         result = self._request(
-            "POST", "/adv/campaigns/stop", json_data={"ids": campaign_ids}
+            "PUT", "/adv/campaigns/stop", json_data={"campaign_ids": campaign_ids}
         )
         return result
 
@@ -183,9 +221,10 @@ class PropellerAdsClient:
             "day_to": date_to,
         }
 
-        # API requires at least one group_by
+        # API requires at least one group_by; values must be enum tokens (see GROUP_BY_MAP)
         if not group_by:
             group_by = ["campaign_id"]
+        group_by = _map_group_by(group_by)
         for i, gb in enumerate(group_by):
             params[f"group_by[{i}]"] = gb
 
@@ -233,11 +272,11 @@ class PropellerAdsClient:
         date_from: str | None = None,
         date_to: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Get statistics grouped by creative."""
+        """Get statistics grouped by creative (PropellerAds calls creatives 'banners')."""
         return self.get_statistics(
             date_from=date_from,
             date_to=date_to,
-            group_by=["creative_id"],
+            group_by=["banner_id"],
             campaign_id=campaign_id,
         )
 
