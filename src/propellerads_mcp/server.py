@@ -111,7 +111,7 @@ TOOLS = [
     # Campaign Management
     Tool(
         name="list_campaigns",
-        description="List all campaigns with optional filters. Returns campaign ID, name, status, ad format, and basic metrics.",
+        description="List all campaigns with optional filters. Returns campaign ID, name, status, rate model, and daily cap. NOTE: status 'paused' (7) is ambiguous - the API cannot say whether a campaign is auto-pacing (late-click / daily-impressions throttle, which auto-resumes), budget-capped, or manually paused; do not read paused as stopped. Cross-check with query_statistics daily spend.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -690,14 +690,28 @@ async def handle_tool(
             return "No campaigns found matching the criteria."
 
         lines = ["# Campaigns\n"]
+        any_paused = False
         for c in campaigns:
             # status is an integer enum (6=working, 7=paused, 8=stopped), not a string
+            if _status_int(c.get("status")) == 7:
+                any_paused = True
             budget = c.get("limit_daily_amount", c.get("daily_amount"))
             archived = " [archived]" if c.get("is_archived") else ""
             lines.append(
                 f"{status_label(c.get('status'))} **{c.get('name', 'Unnamed')}** (ID: {c.get('id')}){archived}\n"
                 f"   Rate model: {c.get('rate_model', 'N/A')} | "
                 f"Daily cap: {format_currency(budget)}\n"
+            )
+        if any_paused:
+            lines.append(
+                "\n> Note on **paused** (status 7): the API does NOT expose *why* a campaign "
+                "is paused. PropellerAds collapses three different states into status 7 — "
+                "(a) auto-pacing / late-click protection or the daily-impressions limit, which "
+                "**auto-resumes** (the campaign is effectively live, just throttled to avoid "
+                "overspending the daily cap on late clicks); (b) the daily budget being reached; "
+                "and (c) a real manual pause. Do NOT treat paused as stopped. To tell them apart, "
+                "check recent daily spend (query_statistics grouped by date) — a campaign still "
+                "spending day over day is pacing, not stopped — or read the dashboard status badge.\n"
             )
         return "\n".join(lines)
 
