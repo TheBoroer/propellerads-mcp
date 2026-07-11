@@ -97,6 +97,8 @@ class PropellerAdsClient:
                 "Accept": "application/json",
             },
             timeout=30.0,
+            # Some endpoints (e.g. /rates) 301-redirect to a trailing-slash URL.
+            follow_redirects=True,
         )
 
     def _request(
@@ -323,44 +325,102 @@ class PropellerAdsClient:
         result = self._request("GET", "/adv/zones", params=params or None)
         return _unwrap(result)
 
+    # Zone targeting. Spec endpoints:
+    #   whitelist (allowed)  = /adv/campaigns/{id}/targeting/include/zone
+    #   blacklist (forbidden) = /adv/campaigns/{id}/targeting/exclude/zone
+    #   GET reads current list, PATCH appends, PUT replaces the whole list.
+    # Body schema is {"zone": ["123", "456"]} — zone IDs are STRINGS.
+    def get_zone_targeting(self, campaign_id: int, kind: str) -> list[str]:
+        """Get current zone list. kind = 'include' (whitelist) or 'exclude' (blacklist)."""
+        data = _unwrap(
+            self._request("GET", f"/adv/campaigns/{campaign_id}/targeting/{kind}/zone")
+        )
+        if isinstance(data, dict):
+            return [str(z) for z in (data.get("zone") or [])]
+        return [str(z) for z in (data or [])]
+
     def add_zones_to_whitelist(
         self, campaign_id: int, zone_ids: list[int]
     ) -> dict[str, Any]:
-        """Add zones to campaign whitelist."""
+        """Append zones to campaign whitelist (PATCH = additive)."""
         return self._request(
-            "POST",
-            f"/adv/campaigns/{campaign_id}/targeting/zones/whitelist",
-            json_data={"zone_ids": zone_ids},
+            "PATCH",
+            f"/adv/campaigns/{campaign_id}/targeting/include/zone",
+            json_data={"zone": [str(z) for z in zone_ids]},
         )
 
     def add_zones_to_blacklist(
         self, campaign_id: int, zone_ids: list[int]
     ) -> dict[str, Any]:
-        """Add zones to campaign blacklist."""
+        """Append zones to campaign blacklist (PATCH = additive)."""
         return self._request(
-            "POST",
-            f"/adv/campaigns/{campaign_id}/targeting/zones/blacklist",
-            json_data={"zone_ids": zone_ids},
+            "PATCH",
+            f"/adv/campaigns/{campaign_id}/targeting/exclude/zone",
+            json_data={"zone": [str(z) for z in zone_ids]},
         )
 
     def remove_zones_from_whitelist(
         self, campaign_id: int, zone_ids: list[int]
     ) -> dict[str, Any]:
-        """Remove zones from campaign whitelist."""
+        """Remove zones from whitelist (no DELETE endpoint: read, filter, PUT the remainder)."""
+        remove = {str(z) for z in zone_ids}
+        keep = [z for z in self.get_zone_targeting(campaign_id, "include") if z not in remove]
         return self._request(
-            "DELETE",
-            f"/adv/campaigns/{campaign_id}/targeting/zones/whitelist",
-            json_data={"zone_ids": zone_ids},
+            "PUT",
+            f"/adv/campaigns/{campaign_id}/targeting/include/zone",
+            json_data={"zone": keep},
         )
 
     def remove_zones_from_blacklist(
         self, campaign_id: int, zone_ids: list[int]
     ) -> dict[str, Any]:
-        """Remove zones from campaign blacklist."""
+        """Remove zones from blacklist (no DELETE endpoint: read, filter, PUT the remainder)."""
+        remove = {str(z) for z in zone_ids}
+        keep = [z for z in self.get_zone_targeting(campaign_id, "exclude") if z not in remove]
         return self._request(
-            "DELETE",
-            f"/adv/campaigns/{campaign_id}/targeting/zones/blacklist",
-            json_data={"zone_ids": zone_ids},
+            "PUT",
+            f"/adv/campaigns/{campaign_id}/targeting/exclude/zone",
+            json_data={"zone": keep},
+        )
+
+    # ========== Creative (banner) start/stop ==========
+
+    def start_creatives(self, creative_ids: list[int]) -> dict[str, Any]:
+        """Start (resume) one or more creatives. Spec: PUT /adv/creatives/start {creative_ids}."""
+        return self._request(
+            "PUT", "/adv/creatives/start", json_data={"creative_ids": creative_ids}
+        )
+
+    def stop_creatives(self, creative_ids: list[int]) -> dict[str, Any]:
+        """Stop (pause) one or more creatives without stopping the campaign.
+        Spec: PUT /adv/creatives/stop {creative_ids}."""
+        return self._request(
+            "PUT", "/adv/creatives/stop", json_data={"creative_ids": creative_ids}
+        )
+
+    # ========== Campaign rates (bids) ==========
+
+    def get_campaign_rates(
+        self, campaign_id: int, only_active: int = 1
+    ) -> list[dict[str, Any]]:
+        """Get campaign rate (bid) rows. only_active: 1 = active only, 0 = all."""
+        result = self._request(
+            "GET",
+            f"/adv/campaigns/{campaign_id}/rates",
+            params={"only_active": only_active},
+        )
+        return _unwrap(result)
+
+    def set_campaign_rates(
+        self, campaign_id: int, rates: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Replace the campaign's rate list. WARNING: PUT closes ALL current rates and
+        installs `rates` in their place. Each rate: {amount: <dollars>, countries: [..]}.
+        Spec: PUT /adv/campaigns/{id}/rates {rates: [...]}."""
+        return self._request(
+            "PUT",
+            f"/adv/campaigns/{campaign_id}/rates",
+            json_data={"rates": rates},
         )
 
     # ========== Account Methods ==========
@@ -371,13 +431,26 @@ class PropellerAdsClient:
         return _unwrap(result)
 
     def get_countries(self) -> list[dict[str, Any]]:
-        """Get available countries for targeting."""
-        result = self._request("GET", "/adv/countries")
+        """Get available countries for targeting. Spec: GET /collections/countries
+        -> {result: [{id, value (ISO alpha-2 lowercase), title}]}."""
+        result = self._request("GET", "/collections/countries")
         return _unwrap(result)
 
     def get_ad_formats(self) -> list[dict[str, Any]]:
-        """Get available ad formats."""
-        result = self._request("GET", "/adv/ad-formats")
+        """Available ad formats. Static enum from spec Format.yaml (no live endpoint;
+        the old /adv/ad-formats path 404s)."""
+        return [
+            {"value": "onclick", "title": "Onclick (Popunder)"},
+            {"value": "ipp", "title": "In-Page Push"},
+            {"value": "classic_push", "title": "Classic Push"},
+            {"value": "survey", "title": "Interactive Ads"},
+            {"value": "telegram", "title": "Telegram Ads"},
+        ]
+
+    def get_collection(self, collection_type: str) -> list[dict[str, Any]]:
+        """Get a targeting collection (os, device, browser, zone, language, ...).
+        Spec: GET /collections/targeting/{type} (or GET /collections for the type list)."""
+        result = self._request("GET", f"/collections/targeting/{collection_type}")
         return _unwrap(result)
 
     def close(self):

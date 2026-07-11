@@ -247,6 +247,70 @@ TOOLS = [
             "required": ["campaign_id"],
         },
     ),
+    # Creative (banner) control
+    Tool(
+        name="start_creatives",
+        description="Start/resume one or more creatives (banners) by ID, without touching the campaign.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "creative_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Creative (banner) IDs to start",
+                },
+            },
+            "required": ["creative_ids"],
+        },
+    ),
+    Tool(
+        name="stop_creatives",
+        description="Stop/pause one or more creatives (banners) by ID while leaving the campaign running. Use to kill a losing creative (30+ clicks, 0 trials) without stopping the whole campaign.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "creative_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Creative (banner) IDs to stop",
+                },
+            },
+            "required": ["creative_ids"],
+        },
+    ),
+    Tool(
+        name="get_campaign_rates",
+        description="Get a campaign's current rate (bid) rows: amount in dollars per country, with active window. Read-only.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+                "only_active": {
+                    "type": "integer",
+                    "enum": [0, 1],
+                    "description": "1 = active rates only (default), 0 = include finished",
+                },
+            },
+            "required": ["campaign_id"],
+        },
+    ),
+    Tool(
+        name="set_campaign_rate",
+        description="Set a campaign's bid. WARNING: this REPLACES all existing rate rows with a single rate (PUT semantics) - existing per-country bids are closed. For CPA Goal campaigns the base bid is the rate; the CPA-goal target is a separate campaign field (cpa_goal_bid via update_campaign). Confirm intent before using on a live campaign.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+                "amount": {"type": "number", "description": "Bid amount in dollars (CPC/CPM)"},
+                "countries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional ISO alpha-2 lowercase country codes the rate applies to; omit for all",
+                },
+            },
+            "required": ["campaign_id", "amount"],
+        },
+    ),
     # Statistics & Reports
     Tool(
         name="get_performance_report",
@@ -582,6 +646,42 @@ async def handle_tool(
             args["campaign_id"], args.get("new_name")
         )
         return f"Campaign cloned successfully!\n\n```json\n{json.dumps(result, indent=2)}\n```"
+
+    # Creative (banner) control
+    elif name == "start_creatives":
+        result = client.start_creatives(args["creative_ids"])
+        return f"Started creatives: {args['creative_ids']}\n\n{json.dumps(result, indent=2)}"
+
+    elif name == "stop_creatives":
+        result = client.stop_creatives(args["creative_ids"])
+        return f"Stopped creatives: {args['creative_ids']}\n\n{json.dumps(result, indent=2)}"
+
+    elif name == "get_campaign_rates":
+        rates = client.get_campaign_rates(
+            args["campaign_id"], only_active=args.get("only_active", 1)
+        )
+        if not rates:
+            return f"No rates found for campaign {args['campaign_id']}."
+        lines = [f"# Rates: campaign {args['campaign_id']}\n"]
+        for r in rates:
+            geo = ", ".join(r.get("countries", []) or []) or "all"
+            lines.append(
+                f"- Rate {r.get('id')}: {format_currency(_num(r.get('amount')))} "
+                f"| countries: {geo} | finished_at: {r.get('finished_at')}\n"
+            )
+        return "".join(lines)
+
+    elif name == "set_campaign_rate":
+        rate: dict[str, Any] = {"amount": args["amount"]}
+        if args.get("countries"):
+            rate["countries"] = args["countries"]
+        result = client.set_campaign_rates(args["campaign_id"], [rate])
+        return (
+            f"Replaced rates for campaign {args['campaign_id']} with "
+            f"{format_currency(_num(args['amount']))} "
+            f"({', '.join(args.get('countries') or ['all countries'])}).\n\n"
+            f"{json.dumps(result, indent=2)}"
+        )
 
     # Statistics
     elif name == "get_performance_report":
