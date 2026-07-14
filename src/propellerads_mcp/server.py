@@ -105,6 +105,115 @@ def calculate_metrics(stats: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Friendly ad-format -> (direction, format-specific targeting). Verified against the
+# v5 Swagger create examples. Classic Push and In-Page Push are BOTH direction=nativeads
+# and differ ONLY by the zone_type targeting block:
+#   Classic Push -> zone_type {list:[42], is_excluded: true}   (exclude in-page zones)
+#   In-Page Push -> zone_type {list:[42], is_excluded: false}  (include only in-page zones)
+#   Interactive  -> direction=onclick + traffic_categories:[all_survey]
+#   Telegram     -> direction=telegram_ads
+FORMAT_RECIPES: dict[str, dict[str, Any]] = {
+    "onclick": {"direction": "onclick"},
+    "classic_push": {"direction": "nativeads", "zone_type": {"list": [42], "is_excluded": True}},
+    "ipp": {"direction": "nativeads", "zone_type": {"list": [42], "is_excluded": False}},
+    "interactive": {"direction": "onclick", "traffic_categories": ["all_survey"]},
+    "telegram": {"direction": "telegram_ads"},
+}
+
+# Targeting dimensions that take a {list, is_excluded} block.
+_LIST_TARGETING = (
+    "os_type", "os", "os_version", "device_type", "device", "browser",
+    "language", "mobile_isp", "user_activity", "zone_type",
+)
+
+
+def _list_block(value: Any, is_excluded: bool = False) -> dict[str, Any]:
+    """Wrap a value (or list) in the API's {list, is_excluded} targeting shape."""
+    items = value if isinstance(value, list) else [value]
+    return {"list": items, "is_excluded": is_excluded}
+
+
+def _build_campaign_payload(args: dict[str, Any]) -> dict[str, Any]:
+    """Build the POST /adv/campaigns body from friendly args.
+
+    Resolves `format` into direction + format-specific targeting, merges friendly
+    targeting scalars, then applies a raw `targeting` override on top. Returns the
+    exact dict that will be POSTed (also surfaced by dry_run)."""
+    fmt = args.get("format")
+    recipe = FORMAT_RECIPES.get(fmt, {}) if fmt else {}
+    direction = args.get("direction") or recipe.get("direction")
+    if not direction:
+        raise PropellerAdsError(
+            "create_campaign needs either `format` (onclick/classic_push/ipp/"
+            "interactive/telegram) or an explicit `direction`."
+        )
+
+    countries = [c.lower() for c in args.get("countries", [])]
+    targeting: dict[str, Any] = {}
+    if countries:
+        targeting["country"] = {"list": countries, "is_excluded": False}
+
+    # Format-derived targeting (zone_type / traffic_categories).
+    if "zone_type" in recipe:
+        targeting["zone_type"] = dict(recipe["zone_type"])
+    if "traffic_categories" in recipe:
+        targeting["traffic_categories"] = list(recipe["traffic_categories"])
+
+    # Friendly list dimensions.
+    for dim in _LIST_TARGETING:
+        if args.get(dim) is not None:
+            targeting[dim] = _list_block(args[dim])
+
+    # Scalar / special-shaped dimensions.
+    if args.get("connection"):
+        targeting["connection"] = args["connection"]
+    if args.get("time_table"):
+        targeting["time_table"] = _list_block(args["time_table"])
+    if args.get("traffic_categories"):
+        tc = args["traffic_categories"]
+        targeting["traffic_categories"] = tc if isinstance(tc, list) else [tc]
+    if args.get("uvc"):
+        targeting["uvc"] = _list_block(args["uvc"])
+
+    # Raw targeting override wins (top-level merge).
+    if isinstance(args.get("targeting"), dict):
+        targeting.update(args["targeting"])
+
+    campaign_data: dict[str, Any] = {
+        "name": args.get("name", "API campaign"),
+        "direction": direction,
+        "rate_model": args["rate_model"],
+        "target_url": args["target_url"],
+        "status": args.get("status", 1),
+        "started_at": args["started_at"],
+        "timezone": args.get("timezone", -5),
+        "targeting": targeting,
+    }
+
+    # rates: explicit rates[] wins, else build one row from bid + countries.
+    if isinstance(args.get("rates"), list) and args["rates"]:
+        campaign_data["rates"] = args["rates"]
+    elif args.get("bid") is not None:
+        campaign_data["rates"] = [{"amount": args["bid"], "countries": countries}]
+
+    for k in ("daily_amount", "total_amount", "frequency", "capping",
+              "expired_at", "allow_zone_update", "cpa_goal_slice_budget"):
+        if args.get(k) is not None:
+            campaign_data[k] = args[k]
+
+    if args.get("cpa_goal_bid") is not None:
+        campaign_data["cpa_goal_bid"] = args["cpa_goal_bid"]
+        campaign_data["cpa_goal_status"] = True
+
+    if isinstance(args.get("audience"), dict):
+        campaign_data["audience"] = args["audience"]
+
+    if isinstance(args.get("creatives"), list) and args["creatives"]:
+        campaign_data["creatives"] = args["creatives"]
+
+    return campaign_data
+
+
 # ========== Tool Definitions ==========
 
 TOOLS = [
@@ -148,24 +257,36 @@ TOOLS = [
     Tool(
         name="create_campaign",
         description=(
-            "Create a campaign (POST /adv/campaigns). Created in draft (status=1) by default; "
-            "start it later with start_campaigns. For Push CPA Goal use direction='nativeads', "
-            "rate_model='cpag'; for Onclick popunder use direction='onclick'. CPA/SCPA rate models "
-            "require ${SUBID} in target_url. Note: campaigns cannot be deleted via API, only archived."
+            "Create a campaign (POST /adv/campaigns), draft by default (status=1); start later "
+            "with start_campaigns. Pick the ad format with `format` (preferred) — it sets the "
+            "right direction + zone_type + traffic_categories automatically:\n"
+            "  onclick = Popunder; classic_push = Classic Push; ipp = In-Page Push; "
+            "interactive = Interactive/Survey ads; telegram = Telegram Ads.\n"
+            "In-Page vs Classic Push are both direction=nativeads and differ ONLY by zone_type "
+            "(handled for you). Rate models: cpm/scpm/cpc/scpc fixed bid; cpag = CPA Goal for Push "
+            "(by clicks); scpa = CPA Goal for Onclick (by impressions). CPA-goal/CPA models require "
+            "${SUBID} in target_url. Rich targeting (os, device, browser, connection, language, etc.) "
+            "is optional; discover valid tokens with get_targeting_options. Pass dry_run=true to get "
+            "the exact payload back WITHOUT creating anything. Campaigns cannot be deleted, only archived."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Campaign name"},
+                "format": {
+                    "type": "string",
+                    "enum": ["onclick", "classic_push", "ipp", "interactive", "telegram"],
+                    "description": "Ad format. Sets direction + zone_type/traffic_categories. Preferred over raw direction.",
+                },
                 "direction": {
                     "type": "string",
-                    "enum": ["onclick", "nativeads"],
-                    "description": "onclick = popunder; nativeads = push/native/interstitial",
+                    "enum": ["onclick", "nativeads", "telegram_ads"],
+                    "description": "Raw direction (advanced). Usually leave unset and use `format`.",
                 },
                 "rate_model": {
                     "type": "string",
                     "enum": ["cpm", "scpm", "cpc", "scpc", "scpa", "cpag"],
-                    "description": "cpag = CPA Goal for Push; scpa = CPA Goal for Onclick; cpc/cpm = fixed bid",
+                    "description": "cpag = CPA Goal for Push; scpa = CPA Goal for Onclick; cpc/scpc/cpm/scpm = fixed/smart bid",
                 },
                 "target_url": {
                     "type": "string",
@@ -176,25 +297,46 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": "ISO alpha-2 lowercase country codes (e.g. ['us','gb','de'])",
                 },
-                "bid": {"type": "number", "description": "Base bid in dollars (builds the rate row)"},
-                "started_at": {
-                    "type": "string",
-                    "description": "Start date in dd/MM/YYYY format",
+                "bid": {"type": "number", "description": "Base bid in dollars (builds one rate row for all countries). Ignored if `rates` given."},
+                "rates": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Advanced: explicit per-country rate rows [{amount, countries:[...]}]. Overrides `bid`.",
                 },
+                "started_at": {"type": "string", "description": "Start date in dd/MM/YYYY format"},
+                "expired_at": {"type": "string", "description": "End date in dd/MM/YYYY format (optional)"},
                 "daily_amount": {"type": "number", "description": "Daily budget cap in USD (Push CPC min $10)"},
                 "total_amount": {"type": "number", "description": "Total budget cap in USD (must exceed daily)"},
                 "cpa_goal_bid": {"type": "number", "description": "Target CPA in dollars (sets cpa_goal_status=true)"},
+                "cpa_goal_slice_budget": {"type": "number", "description": "CPA Goal slice budget (advanced)"},
                 "user_activity": {
                     "type": "array",
                     "items": {"type": "integer", "enum": [1, 2, 3]},
-                    "description": "1=High, 2=Medium, 3=Low activity (protocol: High+Medium only)",
+                    "description": "1=High, 2=Medium, 3=Low (protocol: High+Medium only)",
                 },
-                "frequency": {"type": "integer", "description": "Impressions per user per capping window"},
-                "capping": {"type": "integer", "description": "Frequency-cap window in hours (e.g. 24)"},
+                "os_type": {"type": "array", "items": {"type": "string"}, "description": "OS type tokens (e.g. mobile, desktop). See get_targeting_options('os_type')."},
+                "os": {"type": "array", "items": {"type": "string"}, "description": "OS tokens (e.g. ios, android, windows). See get_targeting_options('os')."},
+                "os_version": {"type": "array", "items": {"type": "string"}, "description": "OS version tokens (e.g. ios13). See get_targeting_options('os_version')."},
+                "device_type": {"type": "array", "items": {"type": "string"}, "description": "Device type tokens. See get_targeting_options('device_type')."},
+                "device": {"type": "array", "items": {"type": "string"}, "description": "Device tokens. See get_targeting_options('device')."},
+                "browser": {"type": "array", "items": {"type": "string"}, "description": "Browser tokens. See get_targeting_options('browser')."},
+                "language": {"type": "array", "items": {"type": "string"}, "description": "Language tokens. See get_targeting_options('language')."},
+                "mobile_isp": {"type": "array", "items": {"type": "string"}, "description": "Mobile ISP tokens. See get_targeting_options('mobile_isp')."},
+                "connection": {"type": "string", "enum": ["mobile", "other"], "description": "Connection type (bare string, not a list)."},
+                "traffic_categories": {"type": "array", "items": {"type": "string"}, "description": "propeller/broker/premium/social_traffic/all_survey. Auto-set for interactive format."},
+                "uvc": {"type": "array", "items": {"type": "string"}, "description": "Telegram only: high_intent / wide_reach."},
+                "time_table": {"type": "array", "items": {"type": "string"}, "description": "Schedule slots like 'Mon00','Tue03' (day+hour). Omit for always-on."},
+                "audience": {"type": "object", "description": "Audience block {topics:[1,2,3], audience_id}."},
+                "targeting": {"type": "object", "description": "Advanced: raw targeting dict merged LAST over everything above (full escape hatch)."},
+                "creatives": {"type": "array", "items": {"type": "object"}, "description": "Optional creatives to attach at create time (raw CampaignCreative dicts: title, description, icon, image, skin, buttons, is_auto...)."},
+                "allow_zone_update": {"type": "boolean", "description": "Auto-add renamed zone IDs to whitelist to avoid perf drop."},
+                "frequency": {"type": "integer", "description": "Impressions per user per capping window (0 = unlimited)"},
+                "capping": {"type": "integer", "description": "Frequency-cap window in SECONDS (e.g. 86400 = 24h)"},
                 "timezone": {"type": "integer", "description": "UTC offset, default -5"},
                 "status": {"type": "integer", "enum": [1, 2], "description": "1=draft (default), 2=submit to moderation"},
+                "dry_run": {"type": "boolean", "description": "If true, return the built POST payload without creating the campaign."},
             },
-            "required": ["name", "direction", "rate_model", "target_url", "countries", "bid", "started_at"],
+            "required": ["rate_model", "target_url", "started_at"],
         },
     ),
     Tool(
@@ -249,7 +391,11 @@ TOOLS = [
     ),
     Tool(
         name="clone_campaign",
-        description="Create a copy of an existing campaign.",
+        description=(
+            "Create a copy of an existing campaign via POST /adv/campaigns/{id}/clone. "
+            "NOTE: this /clone path is NOT in the v5 Swagger spec and may 404 on some accounts; "
+            "if it fails, get_campaign_details then rebuild with create_campaign instead."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -649,8 +795,170 @@ TOOLS = [
     ),
     Tool(
         name="get_ad_formats",
-        description="Get list of available ad formats.",
+        description="List the ad formats create_campaign supports, with the direction + targeting recipe each maps to.",
         inputSchema={"type": "object", "properties": {}},
+    ),
+    # ===== Targeting collections (discover valid tokens) =====
+    Tool(
+        name="get_targeting_options",
+        description=(
+            "List valid values for a targeting dimension so you can build campaign targeting. "
+            "Spec: GET /collections/targeting/{type}. Use before setting os/device/browser/etc."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": [
+                        "region", "city", "time_table", "os_version", "os_type", "os",
+                        "device_type", "device", "browser", "zone", "connection",
+                        "mobile_isp", "proxy", "language", "audience",
+                        "traffic_categories", "uvc",
+                    ],
+                    "description": "Targeting dimension to enumerate.",
+                },
+            },
+            "required": ["type"],
+        },
+    ),
+    Tool(
+        name="list_collection_types",
+        description="List available top-level collection types. Spec: GET /collections.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    # ===== Creatives (banners) =====
+    Tool(
+        name="list_creatives",
+        description="List a campaign's creatives (banners). Spec: GET /adv/campaigns/{id}/creatives.",
+        inputSchema={
+            "type": "object",
+            "properties": {"campaign_id": {"type": "integer", "description": "Campaign ID"}},
+            "required": ["campaign_id"],
+        },
+    ),
+    Tool(
+        name="create_creative",
+        description=(
+            "Add a creative to a campaign. Spec: POST /adv/campaigns/{id}/creatives. Push/IPP need "
+            "icon (base64 data URI); interstitial needs image. IPP uses `skin`; classic push uses "
+            "`buttons`. Set is_auto=true with language_mode for an autocreative (push only)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer", "description": "Campaign ID"},
+                "title": {"type": "string", "description": "Creative title (push max 30 chars)"},
+                "description": {"type": "string", "description": "Creative description (push max 40 chars)"},
+                "icon": {"type": "string", "description": "Icon as base64 data URI (required for push/IPP)"},
+                "image": {"type": "string", "description": "Image as base64 data URI (required for interstitial)"},
+                "skin": {"type": "string", "enum": ["auto", "default", "social", "light_theme"], "description": "In-Page Push skin"},
+                "buttons": {"type": "array", "items": {"type": "object"}, "description": "Classic push buttons [{name}]"},
+                "default_button_disabled": {"type": "boolean"},
+                "status": {"type": "integer", "enum": [1, 2], "description": "1=active, 2=disabled"},
+                "is_auto": {"type": "boolean", "description": "Autocreative (push only). Only send status/language_mode/language with this."},
+                "language_mode": {"type": "string", "enum": ["by_geo", "by_browser", "custom"]},
+                "language": {"type": "string", "description": "ISO 639-1, only with language_mode=custom"},
+                "creative": {"type": "object", "description": "Advanced: raw CampaignCreative dict, merged over the fields above."},
+            },
+            "required": ["campaign_id"],
+        },
+    ),
+    Tool(
+        name="update_creative",
+        description="Update a creative. Spec: PUT /adv/creatives/{id}. Pass the fields to change in `updates`.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "creative_id": {"type": "integer", "description": "Creative (banner) ID"},
+                "updates": {"type": "object", "description": "Fields to update"},
+            },
+            "required": ["creative_id", "updates"],
+        },
+    ),
+    # ===== Campaign targeting management (existing campaign) =====
+    Tool(
+        name="get_campaign_targeting",
+        description=(
+            "Read a campaign's whole allowed (include) or forbidden (exclude) targeting map. "
+            "Spec: GET /adv/campaigns/{id}/targeting/{include|exclude}. Returns {dimension: [values]}, "
+            "e.g. exclude -> {zone:[...blacklist...], zone_type:[42,78,119], proxy:[true]}."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer"},
+                "mode": {"type": "string", "enum": ["include", "exclude"], "description": "include = allowed, exclude = forbidden"},
+            },
+            "required": ["campaign_id", "mode"],
+        },
+    ),
+    Tool(
+        name="set_campaign_targeting",
+        description=(
+            "Replace a campaign's WHOLE include or exclude targeting model (PUT). `targeting` is a "
+            "{dimension: [values]} map, e.g. {os_type:['mobile'], os:['android'], "
+            "user_activity:[1,2]}. WARNING: this overwrites every dimension in that mode — read "
+            "with get_campaign_targeting first and merge yourself. For just adding/removing zones "
+            "use add_to_blacklist / add_to_whitelist instead."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer"},
+                "mode": {"type": "string", "enum": ["include", "exclude"]},
+                "targeting": {"type": "object", "description": "{dimension: [values]} map to write for this mode"},
+            },
+            "required": ["campaign_id", "mode", "targeting"],
+        },
+    ),
+    Tool(
+        name="set_sub_zone_targeting",
+        description="Append sub-zones to a campaign's include or exclude list. Spec: PATCH /adv/campaigns/{id}/targeting/{kind}/sub_zone.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer"},
+                "kind": {"type": "string", "enum": ["include", "exclude"]},
+                "sub_zone_ids": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["campaign_id", "kind", "sub_zone_ids"],
+        },
+    ),
+    Tool(
+        name="set_sub_zone_other",
+        description="Exclude 'Other' subzones. mode=ALL excludes all globally; mode=TARGET_ZONES excludes per given zone_ids.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "integer"},
+                "mode": {"type": "string", "enum": ["ALL", "TARGET_ZONES"]},
+                "zone_ids": {"type": "array", "items": {"type": "integer"}, "description": "Required for TARGET_ZONES"},
+            },
+            "required": ["campaign_id", "mode"],
+        },
+    ),
+    # ===== Misc reads =====
+    Tool(
+        name="get_zone_group",
+        description="Get one zone group's detail. Spec: GET /adv/zone-groups/{id}.",
+        inputSchema={
+            "type": "object",
+            "properties": {"group_id": {"type": "integer"}},
+            "required": ["group_id"],
+        },
+    ),
+    Tool(
+        name="get_campaigns_rates",
+        description="Rate rows for a LIST of campaigns. Spec: GET /adv/campaigns/rates (campaign_ids required).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_ids": {"type": "array", "items": {"type": "integer"}, "description": "Campaign IDs to fetch rates for"},
+                "only_active": {"type": "integer", "enum": [0, 1], "description": "1=active only (default)"},
+            },
+            "required": ["campaign_ids"],
+        },
     ),
 ]
 
@@ -720,31 +1028,13 @@ async def handle_tool(
         return f"# Campaign Details\n\n```json\n{json.dumps(campaign, indent=2)}\n```"
 
     elif name == "create_campaign":
-        countries = [c.lower() for c in args["countries"]]
-        targeting: dict[str, Any] = {
-            "country": {"list": countries, "is_excluded": False},
-        }
-        if args.get("user_activity"):
-            targeting["user_activity"] = {"list": args["user_activity"], "is_excluded": False}
-
-        campaign_data: dict[str, Any] = {
-            "name": args["name"],
-            "direction": args["direction"],
-            "rate_model": args["rate_model"],
-            "target_url": args["target_url"],
-            "status": args.get("status", 1),
-            "started_at": args["started_at"],
-            "timezone": args.get("timezone", -5),
-            "targeting": targeting,
-            "rates": [{"amount": args["bid"], "countries": countries}],
-        }
-        for k in ("daily_amount", "total_amount", "frequency", "capping"):
-            if args.get(k) is not None:
-                campaign_data[k] = args[k]
-        if args.get("cpa_goal_bid") is not None:
-            campaign_data["cpa_goal_bid"] = args["cpa_goal_bid"]
-            campaign_data["cpa_goal_status"] = True
-
+        campaign_data = _build_campaign_payload(args)
+        if args.get("dry_run"):
+            return (
+                "DRY RUN — payload NOT sent. This is the exact body that would POST "
+                "to /adv/campaigns:\n\n```json\n"
+                f"{json.dumps(campaign_data, indent=2)}\n```"
+            )
         result = client.create_campaign(campaign_data)
         return f"Campaign created (draft unless status=2).\n\n```json\n{json.dumps(result, indent=2)}\n```"
 
@@ -1223,6 +1513,64 @@ async def handle_tool(
     elif name == "get_ad_formats":
         formats = client.get_ad_formats()
         return f"# Available Ad Formats\n\n```json\n{json.dumps(formats, indent=2)}\n```"
+
+    # ===== Targeting collections =====
+    elif name == "get_targeting_options":
+        options = client.get_collection(args["type"])
+        return f"# Targeting options: {args['type']}\n\n```json\n{json.dumps(options, indent=2)}\n```"
+
+    elif name == "list_collection_types":
+        types = client.list_collection_types()
+        return f"# Collection Types\n\n```json\n{json.dumps(types, indent=2)}\n```"
+
+    # ===== Creatives =====
+    elif name == "list_creatives":
+        creatives = client.list_campaign_creatives(args["campaign_id"])
+        return f"# Creatives for campaign {args['campaign_id']}\n\n```json\n{json.dumps(creatives, indent=2)}\n```"
+
+    elif name == "create_creative":
+        creative = {
+            k: args[k]
+            for k in (
+                "title", "description", "icon", "image", "skin", "buttons",
+                "default_button_disabled", "status", "is_auto", "language_mode", "language",
+            )
+            if args.get(k) is not None
+        }
+        if isinstance(args.get("creative"), dict):
+            creative.update(args["creative"])
+        result = client.create_campaign_creative(args["campaign_id"], creative)
+        return f"Creative added to campaign {args['campaign_id']}.\n\n```json\n{json.dumps(result, indent=2)}\n```"
+
+    elif name == "update_creative":
+        result = client.update_creative(args["creative_id"], args["updates"])
+        return f"Creative {args['creative_id']} updated.\n\n```json\n{json.dumps(result, indent=2)}\n```"
+
+    # ===== Campaign targeting management =====
+    elif name == "get_campaign_targeting":
+        data = client.get_campaign_targeting(args["campaign_id"], args["mode"])
+        return f"# Targeting ({args['mode']}) on campaign {args['campaign_id']}\n\n```json\n{json.dumps(data, indent=2)}\n```"
+
+    elif name == "set_campaign_targeting":
+        result = client.set_campaign_targeting(args["campaign_id"], args["mode"], args["targeting"])
+        return f"Targeting ({args['mode']}) replaced on campaign {args['campaign_id']}.\n\n```json\n{json.dumps(result, indent=2)}\n```"
+
+    elif name == "set_sub_zone_targeting":
+        result = client.add_sub_zones(args["campaign_id"], args["kind"], args["sub_zone_ids"])
+        return f"Added {len(args['sub_zone_ids'])} sub-zones to {args['kind']} on campaign {args['campaign_id']}.\n\n```json\n{json.dumps(result, indent=2)}\n```"
+
+    elif name == "set_sub_zone_other":
+        result = client.set_sub_zone_other(args["campaign_id"], args["mode"], args.get("zone_ids"))
+        return f"sub_zone_other ({args['mode']}) set on campaign {args['campaign_id']}.\n\n```json\n{json.dumps(result, indent=2)}\n```"
+
+    # ===== Misc reads =====
+    elif name == "get_zone_group":
+        group = client.get_zone_group(args["group_id"])
+        return f"# Zone Group {args['group_id']}\n\n```json\n{json.dumps(group, indent=2)}\n```"
+
+    elif name == "get_campaigns_rates":
+        rates = client.get_campaigns_rates(args["campaign_ids"], only_active=args.get("only_active", 1))
+        return f"# Campaign Rates\n\n```json\n{json.dumps(rates, indent=2)}\n```"
 
     else:
         return f"Unknown tool: {name}"

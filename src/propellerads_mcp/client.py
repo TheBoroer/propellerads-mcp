@@ -544,21 +544,151 @@ class PropellerAdsClient:
         return _unwrap(result)
 
     def get_ad_formats(self) -> list[dict[str, Any]]:
-        """Available ad formats. Static enum from spec Format.yaml (no live endpoint;
-        the old /adv/ad-formats path 404s)."""
+        """Ad formats create_campaign supports, with the direction + targeting recipe each
+        maps to (verified against the v5 Swagger create examples). No live endpoint exists;
+        this documents how `format` is resolved. Classic Push and In-Page Push are both
+        direction=nativeads and differ ONLY by the zone_type block."""
         return [
-            {"value": "onclick", "title": "Onclick (Popunder)"},
-            {"value": "ipp", "title": "In-Page Push"},
-            {"value": "classic_push", "title": "Classic Push"},
-            {"value": "survey", "title": "Interactive Ads"},
-            {"value": "telegram", "title": "Telegram Ads"},
+            {"format": "onclick", "title": "Onclick (Popunder)", "direction": "onclick",
+             "rate_models": ["cpm", "scpm", "cpc", "scpc", "scpa"]},
+            {"format": "classic_push", "title": "Classic Push", "direction": "nativeads",
+             "zone_type": {"list": [42], "is_excluded": True},
+             "rate_models": ["cpag", "cpc", "scpc"]},
+            {"format": "ipp", "title": "In-Page Push", "direction": "nativeads",
+             "zone_type": {"list": [42], "is_excluded": False},
+             "rate_models": ["cpag", "cpc", "scpc"]},
+            {"format": "interactive", "title": "Interactive Ads (Survey)", "direction": "onclick",
+             "traffic_categories": ["all_survey"], "rate_models": ["scpa", "cpc", "scpc"]},
+            {"format": "telegram", "title": "Telegram Ads", "direction": "telegram_ads",
+             "uvc": ["high_intent", "wide_reach"], "rate_models": ["cpag", "scpc", "cpc"]},
         ]
 
     def get_collection(self, collection_type: str) -> list[dict[str, Any]]:
         """Get a targeting collection (os, device, browser, zone, language, ...).
-        Spec: GET /collections/targeting/{type} (or GET /collections for the type list)."""
+        Spec: GET /collections/targeting/{type}. Valid types: region, city, time_table,
+        os_version, os_type, os, device_type, device, browser, zone, connection,
+        mobile_isp, proxy, language, audience, traffic_categories, uvc."""
         result = self._request("GET", f"/collections/targeting/{collection_type}")
         return _unwrap(result)
+
+    def list_collection_types(self) -> list[dict[str, Any]]:
+        """List available top-level collection types. Spec: GET /collections."""
+        return _unwrap(self._request("GET", "/collections"))
+
+    def get_collection_by_type(self, collection_type: str) -> list[dict[str, Any]]:
+        """Get a non-targeting collection by type. Spec: GET /collections/{type}."""
+        return _unwrap(self._request("GET", f"/collections/{collection_type}"))
+
+    # ========== Zone groups (single) ==========
+
+    def get_zone_group(self, group_id: int) -> dict[str, Any]:
+        """Get one zone group's detail. Spec: GET /adv/zone-groups/{id}."""
+        return _unwrap(self._request("GET", f"/adv/zone-groups/{group_id}"))
+
+    # ========== Bulk rates for a list of campaigns ==========
+
+    def get_campaigns_rates(
+        self, campaign_ids: list[int], only_active: int = 1
+    ) -> list[dict[str, Any]]:
+        """Rate rows for a LIST of campaigns. Spec: GET /adv/campaigns/rates/ with the
+        required campaign_ids[] query array (the endpoint 400s if it is blank)."""
+        params: dict[str, Any] = {"only_active": only_active}
+        for i, cid in enumerate(campaign_ids):
+            params[f"campaign_ids[{i}]"] = cid
+        return _unwrap(self._request("GET", "/adv/campaigns/rates/", params=params))
+
+    # ========== Creatives under a campaign ==========
+
+    def list_campaign_creatives(self, campaign_id: int) -> list[dict[str, Any]]:
+        """A campaign's creatives. There is no GET creatives endpoint (the path is
+        POST-only), so read them from the campaign object's `creatives` array."""
+        campaign = self.get_campaign(campaign_id)
+        if isinstance(campaign, dict):
+            return campaign.get("creatives") or []
+        return []
+
+    def create_campaign_creative(
+        self, campaign_id: int, creative: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Add a creative to a campaign. Spec: POST /adv/campaigns/{id}/creatives with the
+        body wrapped as {"creatives": [ ... ]}. creative fields: title, description, icon
+        (base64), image (base64, push/interstitial), skin (IPP: auto/default/social/
+        light_theme), buttons, default_button_disabled, status, is_auto + language_mode."""
+        return _unwrap(
+            self._request(
+                "POST",
+                f"/adv/campaigns/{campaign_id}/creatives",
+                json_data={"creatives": [creative]},
+            )
+        )
+
+    # ========== Whole-model campaign targeting (existing campaign) ==========
+
+    # /targeting/{mode} where mode = "include" (allowed) or "exclude" (forbidden).
+    # GET returns a {dimension: [values]} map; PUT REPLACES the whole mode with a
+    # TargetingPutModel: {"targeting": [{"targeting": <dim>, "values": [...]}, ...]}.
+    def get_campaign_targeting(self, campaign_id: int, mode: str) -> Any:
+        """Read the whole include/exclude targeting map. Spec:
+        GET /adv/campaigns/{id}/targeting/{include|exclude}/."""
+        return _unwrap(
+            self._request("GET", f"/adv/campaigns/{campaign_id}/targeting/{mode}/")
+        )
+
+    def set_campaign_targeting(
+        self, campaign_id: int, mode: str, targeting_map: dict[str, list[Any]]
+    ) -> dict[str, Any]:
+        """Replace the whole include/exclude targeting model. WARNING: this overwrites
+        every dimension in that mode. targeting_map is {dimension: [values]}; it is
+        converted to the API's TargetingPutModel. Spec: PUT
+        /adv/campaigns/{id}/targeting/{include|exclude}/."""
+        body = {
+            "targeting": [
+                {"targeting": dim, "values": vals}
+                for dim, vals in targeting_map.items()
+            ]
+        }
+        return self._request(
+            "PUT", f"/adv/campaigns/{campaign_id}/targeting/{mode}/", json_data=body
+        )
+
+    # ========== Sub-zone targeting ==========
+
+    def get_sub_zone_targeting(self, campaign_id: int, kind: str) -> list[str]:
+        """Read sub-zone list. kind = 'include' | 'exclude'.
+        Spec: GET /adv/campaigns/{id}/targeting/{kind}/sub_zone."""
+        data = _unwrap(
+            self._request(
+                "GET", f"/adv/campaigns/{campaign_id}/targeting/{kind}/sub_zone"
+            )
+        )
+        if isinstance(data, dict):
+            return [str(z) for z in (data.get("sub_zone") or [])]
+        return [str(z) for z in (data or [])]
+
+    def add_sub_zones(
+        self, campaign_id: int, kind: str, sub_zone_ids: list[int]
+    ) -> dict[str, Any]:
+        """Append sub-zones to include/exclude (PATCH = additive).
+        Spec: PATCH /adv/campaigns/{id}/targeting/{kind}/sub_zone."""
+        return self._request(
+            "PATCH",
+            f"/adv/campaigns/{campaign_id}/targeting/{kind}/sub_zone",
+            json_data={"sub_zone": [str(z) for z in sub_zone_ids]},
+        )
+
+    def set_sub_zone_other(
+        self, campaign_id: int, mode: str, zone_ids: list[int] | None = None
+    ) -> dict[str, Any]:
+        """Exclude 'Other' subzones. mode = 'ALL' (exclude all globally) or
+        'TARGET_ZONES' (per-zone). Spec: PUT /adv/campaigns/{id}/targeting/sub_zone_other."""
+        payload: dict[str, Any] = {"type": mode, "is_excluded": True}
+        if mode == "TARGET_ZONES":
+            payload["list"] = [int(z) for z in (zone_ids or [])]
+        return self._request(
+            "PUT",
+            f"/adv/campaigns/{campaign_id}/targeting/sub_zone_other",
+            json_data=payload,
+        )
 
     def close(self):
         """Close the HTTP client."""
